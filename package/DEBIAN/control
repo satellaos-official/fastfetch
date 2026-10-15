@@ -1,0 +1,9 @@
+Package: fastfetch
+Version: 2.69.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: SatellaOS Developer
+Description: Fastfetch with SatellaOS branding
+ Custom Fastfetch build featuring the SatellaOS logo
+ and magenta-colored information keys.
