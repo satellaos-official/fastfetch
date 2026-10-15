@@ -140,7 +140,7 @@ The script exits with a non-zero status and prints the usage information when:
 
 - no parameter is given,
 - an unknown parameter is given,
-- more than one action is given (e.g. `--build-binary --package`),
+- more than one action is given (e.g. `--build-binary, --package`),
 - no action is given (only options),
 - `--package` is given without a format, or with more than one (e.g. `--package --deb --rpm`),
 - a format option is used without `--package`,
