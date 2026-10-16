@@ -1,6 +1,6 @@
 # Fastfetch for SatellaOS
 
-A fork of [Fastfetch](https://github.com/fastfetch-cli/fastfetch) 2.69.0 that adds the **SatellaOS logo** and a **one-command build and packaging script** (`.deb`, Arch `.pkg.tar.zst` and `.rpm`), plus a small GUI tool for adding new ASCII logos.
+A fork of [Fastfetch](https://github.com/fastfetch-cli/fastfetch) 2.69.0 that adds the **SatellaOS logo** and a **one-command build and packaging script** (`.deb`, Arch `.pkg.tar.zst` and `.rpm`), plus a small GUI tool for managing ASCII logos and presets.
 
 It is part of the [SatellaOS](https://github.com/satellaos-official) ecosystem, but it builds and runs on any Linux distribution.
 
@@ -13,7 +13,7 @@ What it adds on top of upstream Fastfetch:
 - **SatellaOS logo** (`src/logo/ascii/s/satellaos.txt`), registered in `src/logo/ascii/s.inc` under the names `satellaos` and `SatellaOS`, with a purple (`127;63;191`) and white logo and purple keys and title.
 - **`build.sh`**: a single script that installs dependencies, compiles and creates a package for Debian, Arch Linux or Fedora.
 - **Packaging files**: `package/DEBIAN/control`, `PKGBUILD` and `fastfetch.spec`.
-- **`fastfetch-editor.py`**: an optional PyQt6 tool for adding, editing and deleting ASCII logos in the source tree.
+- **`fastfetch-editor.py`**: an optional PyQt6 tool for adding, editing and deleting ASCII logos in the source tree, and for previewing, editing and installing presets.
 - **Documentation** of the whole workflow, so it is easy to start from and modify.
 
 Try the logo after building:
@@ -122,7 +122,7 @@ The packages install `fastfetch` and `flashfetch` to `/usr/bin`. The version and
 ```
 .
 ├── build.sh               # build and packaging script
-├── fastfetch-editor.py    # optional GUI for adding ASCII logos
+├── fastfetch-editor.py    # optional GUI for ASCII logos and presets
 ├── build/                 # fastfetch and flashfetch binaries only
 ├── dist/                  # finished packages
 ├── package/DEBIAN/        # Debian control files
@@ -160,7 +160,7 @@ fastfetch --version
 
 ## Fastfetch Editor (Optional GUI)
 
-`fastfetch-editor.py` is an optional graphical tool for **adding, editing and deleting ASCII logos** in the Fastfetch source tree, so you do not have to edit the logo files by hand. It is separate from `build.sh` and is not required to build or package Fastfetch. The project folder is chosen at the top of the window and shared by both tabs.
+`fastfetch-editor.py` is an optional graphical tool for **adding, editing and deleting ASCII logos** in the Fastfetch source tree, so you do not have to edit the logo files by hand, and for **previewing, editing and installing presets**. It is separate from `build.sh` and is not required to build or package Fastfetch. The project folder is chosen at the top of the window and shared by all tabs.
 
 **Add logo tab.** Fill in the form and the tool will:
 
@@ -178,6 +178,18 @@ In the form you choose the folder letter, file name, display name, logo names (u
 The folder letter and file name of an existing logo cannot be changed here; delete it and add it again to move or rename it. Entries marked `(!)` in the list contain something the editor cannot reproduce exactly (for example comments inside the entry). For those, the entry details are read-only, so nothing is lost, but you can still edit the logo text or delete them.
 
 After adding or changing a logo, rebuild Fastfetch and try it with `fastfetch --logo <name>`.
+
+**Presets tab.** Pick one of the presets in `presets/` (the list can be filtered, `examples/` presets are included) and edit its JSONC text on the left. The right side shows what Fastfetch prints with the text in the editor, including the logo and colors; use **Refresh preview** to run it again, or tick **Update while typing**. The preview runs `build/fastfetch` (or the `fastfetch` found in `PATH`; another binary can be chosen with **Browse...**), so build it first with `./build.sh --build-binary`. The text is checked as JSONC while you type. **Save changes** writes it back to the preset file, **Save as...** stores it as a new preset in `presets/`, and **Revert** reloads it from disk.
+
+The three buttons at the bottom install the preset text in the editor (including unsaved edits) as `config.jsonc`, after a confirmation that shows exactly what will run. Each one creates the folder with `mkdir -p` first and replaces an existing `config.jsonc`:
+
+| Button                    | Target                                  | Notes                                                                         |
+|---------------------------|-----------------------------------------|-------------------------------------------------------------------------------|
+| **Apply for current user** | `~/.config/fastfetch/config.jsonc`      |                                                                               |
+| **Apply for other users**  | `/etc/skel/.config/fastfetch/config.jsonc` | Only users created from now on get it; existing users are not changed. Asks for the administrator password (`pkexec`). |
+| **Apply for root**         | `/root/.config/fastfetch/config.jsonc`  | Asks for the administrator password (`pkexec`).                               |
+
+The two administrator buttons need `pkexec` (polkit), unless the editor is started as root.
 
 The editor requires **Python 3** and **PyQt6**.
 

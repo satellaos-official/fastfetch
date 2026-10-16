@@ -94,6 +94,31 @@ static const FFlogo S[] = {
         },
     },
     #endif
+    #ifdef FASTFETCH_DATATEXT_LOGO_SATELLAOS
+    // SatellaOS
+    {
+        .names = { "satellaos", "SatellaOS" },
+        .lines = FASTFETCH_DATATEXT_LOGO_SATELLAOS,
+        .colors = {
+            FF_COLOR_FG_RGB "127;63;191",
+        },
+        .colorKeys = FF_COLOR_FG_RGB "127;63;191",
+        .colorTitle = FF_COLOR_FG_RGB "127;63;191",
+    },
+    #endif
+    #ifdef FASTFETCH_DATATEXT_LOGO_SATELLAOS_SMALL
+    // SatellaOSSmall
+    {
+        .names = { "satellaos_small", "SatellaOS_small" },
+        .lines = FASTFETCH_DATATEXT_LOGO_SATELLAOS_SMALL,
+        .type = FF_LOGO_LINE_TYPE_SMALL_BIT,
+        .colors = {
+            FF_COLOR_FG_RGB "127;63;191",
+        },
+        .colorKeys = FF_COLOR_FG_RGB "127;63;191",
+        .colorTitle = FF_COLOR_FG_RGB "127;63;191",
+    },
+    #endif
     #ifdef FASTFETCH_DATATEXT_LOGO_SCIENTIFIC
     // Scientific
     {
@@ -523,19 +548,6 @@ static const FFlogo S[] = {
             FF_COLOR_FG_BLUE,
             FF_COLOR_FG_WHITE,
         },
-    },
-    #endif
-    #ifdef FASTFETCH_DATATEXT_LOGO_SATELLAOS
-    // SatellaOS
-    {
-        .names = { "satellaos", "SatellaOS" },
-        .lines = FASTFETCH_DATATEXT_LOGO_SATELLAOS,
-        .colors = {
-            FF_COLOR_FG_RGB "127;63;191",
-            FF_COLOR_FG_WHITE,
-        },
-        .colorKeys = FF_COLOR_FG_RGB "127;63;191",
-        .colorTitle = FF_COLOR_FG_RGB "127;63;191",
     },
     #endif
     // LAST

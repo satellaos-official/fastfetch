@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 fastfetch-editor: a small GUI that adds, edits and deletes ASCII logos in the
-fastfetch source tree.
+fastfetch source tree, and previews, edits and installs fastfetch presets.
 
 "Add logo" tab: fill in the boxes and the tool will
   1. copy the logo text into   src/logo/ascii/<letter>/<name>.txt
@@ -17,8 +17,15 @@ Entries that contain something the editor cannot reproduce exactly (for example
 comments inside the entry) are never rewritten: their details are read-only,
 only the logo text can be edited, and they can still be deleted.
 
+"Presets" tab: pick one of the presets in <project>/presets, edit its JSONC text and see
+what fastfetch prints with it in the preview on the right (this needs a built fastfetch:
+<project>/build/fastfetch, or one found in PATH). Three buttons at the bottom install the
+preset text as config.jsonc in ~/.config/fastfetch (current user), in
+/etc/skel/.config/fastfetch (users created later) or in /root/.config/fastfetch (root).
+The last two ask for the administrator password through pkexec.
+
 Usage:
-    python3 fastfetch-editor.py [path/to/fastfetch-2.69.0]
+    python3 fastfetch-editor-v3.py [path/to/fastfetch-2.69.0]
 
 Requires PyQt6 (pip install PyQt6, or your distribution's python-pyqt6 package).
 """
@@ -26,8 +33,13 @@ Requires PyQt6 (pip install PyQt6, or your distribution's python-pyqt6 package).
 from __future__ import annotations
 
 import html
+import json
+import os
 import re
+import shutil
 import sys
+import tempfile
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional
@@ -700,18 +712,376 @@ def find_project_root(argument: Optional[str]) -> Optional[Path]:
 
 
 # ----------------------------------------------------------------------------
+# Presets: JSONC check, terminal preview and installing a preset
+# ----------------------------------------------------------------------------
+
+PRESETS_REL = Path("presets")
+CONFIG_NAME = "config.jsonc"
+PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+PREVIEW_COLUMNS = 120          # terminal size reported to fastfetch for the preview
+PREVIEW_LINES = 40
+PREVIEW_TIMEOUT_MS = 30000
+PREVIEW_BACKGROUND = "#1e1e1e"
+PREVIEW_FONT_SHRINK = 4        # the preview font is this many points smaller (4 steps of Ctrl + mouse wheel)
+
+# Run with "sh -c": $1 is the target directory, $2 the file that is installed there.
+APPLY_SCRIPT = f'mkdir -p -- "$1" && install -m 644 -- "$2" "$1/{CONFIG_NAME}"'
+
+
+@dataclass
+class Preset:
+    name: str    # shown in the list, e.g. "satellaos" or "examples/10"
+    path: Path
+
+
+def _natural_key(text: str) -> list:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def scan_presets(root: Path) -> list[Preset]:
+    """All *.jsonc files below <root>/presets: top-level files first, then sub-folders."""
+    base = root / PRESETS_REL
+    if not base.is_dir():
+        return []
+    found = []
+    for path in base.rglob("*.jsonc"):
+        if path.is_file():
+            found.append(Preset(path.relative_to(base).with_suffix("").as_posix(), path))
+    found.sort(key=lambda preset: ("/" in preset.name, _natural_key(preset.name)))
+    return found
+
+
+_JSONC_COMMENT_RE = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
+_TRAILING_COMMA_RE = re.compile(r'"(?:[^"\\]|\\.)*"|,(?=\s*[}\]])', re.DOTALL)
+
+
+def strip_jsonc(text: str) -> str:
+    """Turn JSONC (comments, trailing commas) into plain JSON. Line numbers are kept."""
+    def drop_comment(match: re.Match) -> str:
+        piece = match.group(0)
+        if piece.startswith('"'):
+            return piece
+        return "\n" * piece.count("\n") if piece.startswith("/*") else ""
+
+    def drop_comma(match: re.Match) -> str:
+        piece = match.group(0)
+        return piece if piece.startswith('"') else ""
+
+    return _TRAILING_COMMA_RE.sub(drop_comma, _JSONC_COMMENT_RE.sub(drop_comment, text))
+
+
+def jsonc_error(text: str) -> Optional[str]:
+    """None when `text` is valid JSONC, otherwise a short description of the first problem."""
+    try:
+        json.loads(strip_jsonc(text))
+    except json.JSONDecodeError as exc:
+        return f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+    return None
+
+
+# A cell style is (foreground, background, bold, italic, underline, reverse); colors are
+# "#rrggbb" strings or None for the terminal default.
+_BLANK_STYLE = (None, None, False, False, False, False)
+_ANSI_TOKEN_RE = re.compile(
+    r"\x1b\[(?P<params>[0-?]*)[ -/]*(?P<final>[@-~])"      # CSI sequence (colors, cursor, erase)
+    r"|\x1b\](?P<osc>[^\x07\x1b]*)(?:\x07|\x1b\\)?"        # OSC sequence (window title, ...)
+    r"|\x1b(?P<esc>[()*+][0-9A-Za-z]|.)"                   # charset selection, save/restore cursor
+    r"|(?P<text>[^\x1b]+)",
+    re.DOTALL,
+)
+
+
+class AnsiScreen:
+    """
+    A tiny terminal emulator. It replays the escape sequences fastfetch prints (colors,
+    cursor movement, erasing) into a grid of characters, so that the logo and the module
+    lines end up side by side exactly like in a real terminal, and shows the result as HTML.
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[list[tuple[str, tuple]]] = [[]]    # every cell is (text, style)
+        self.row = 0
+        self.col = 0
+        self.style = _BLANK_STYLE
+        self.saved = (0, 0)
+
+    # ---- input ---------------------------------------------------------
+    def feed(self, data: str) -> None:
+        for token in _ANSI_TOKEN_RE.finditer(data):
+            text = token.group("text")
+            if text is not None:
+                self._write(text)
+            elif token.group("final") is not None:
+                self._csi(token.group("params"), token.group("final"))
+            elif token.group("esc") == "7":
+                self.saved = (self.row, self.col)
+            elif token.group("esc") == "8":
+                self.row, self.col = self.saved
+
+    def _write(self, text: str) -> None:
+        for ch in text:
+            if ch == "\n":
+                self.row += 1
+                self.col = 0
+            elif ch == "\r":
+                self.col = 0
+            elif ch == "\t":
+                for _ in range(8 - self.col % 8):
+                    self._put(" ")
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+            elif ch >= " " and ch != "\x7f":
+                self._put(ch)
+
+    def _line(self) -> list:
+        while len(self.rows) <= self.row:
+            self.rows.append([])
+        return self.rows[self.row]
+
+    def _put(self, ch: str) -> None:
+        line = self._line()
+        if unicodedata.combining(ch):                      # accents stick to the previous cell
+            if 0 < self.col <= len(line):
+                base, style = line[self.col - 1]
+                line[self.col - 1] = (base + ch, style)
+            return
+        width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        while len(line) < self.col:
+            line.append((" ", _BLANK_STYLE))
+        line[self.col:self.col + width] = [(ch, self.style)] + [("", self.style)] * (width - 1)
+        self.col += width
+
+    def _csi(self, params: str, final: str) -> None:
+        if params[:1] in ("?", "<", "=", ">"):
+            return                                         # private modes: cursor, line wrap, ...
+        args = [int(p) if p.isdigit() else 0 for p in params.split(";")] if params else []
+        first = args[0] if args and args[0] > 0 else 1
+        if final == "m":
+            self._sgr(args)
+        elif final == "A":
+            self.row = max(0, self.row - first)
+        elif final == "B":
+            self.row += first
+        elif final == "C":
+            self.col += first
+        elif final == "D":
+            self.col = max(0, self.col - first)
+        elif final == "E":
+            self.row += first
+            self.col = 0
+        elif final == "F":
+            self.row = max(0, self.row - first)
+            self.col = 0
+        elif final == "G":
+            self.col = first - 1
+        elif final in ("H", "f"):
+            self.row = first - 1
+            self.col = (args[1] if len(args) > 1 and args[1] > 0 else 1) - 1
+        elif final == "d":
+            self.row = first - 1
+        elif final == "K":
+            self._erase_line(args[0] if args else 0)
+        elif final == "J":
+            self._erase_display(args[0] if args else 0)
+        elif final == "s":
+            self.saved = (self.row, self.col)
+        elif final == "u":
+            self.row, self.col = self.saved
+
+    def _erase_line(self, mode: int) -> None:
+        line = self._line()
+        if mode == 0:
+            del line[self.col:]
+        elif mode == 1:
+            line[:self.col + 1] = [(" ", _BLANK_STYLE)] * (self.col + 1)
+        else:
+            line.clear()
+
+    def _erase_display(self, mode: int) -> None:
+        if mode == 0:
+            self._erase_line(0)
+            del self.rows[self.row + 1:]
+        elif mode == 1:
+            self._erase_line(1)
+            for index in range(min(self.row, len(self.rows))):
+                self.rows[index] = []
+        else:
+            self.rows = [[]]
+
+    def _sgr(self, args: list) -> None:
+        fg, bg, bold, italic, underline, reverse = self.style
+        args = args or [0]
+        i = 0
+        while i < len(args):
+            code = args[i]
+            if code == 0:
+                fg = bg = None
+                bold = italic = underline = reverse = False
+            elif code == 1:
+                bold = True
+            elif code == 3:
+                italic = True
+            elif code == 4:
+                underline = True
+            elif code == 7:
+                reverse = True
+            elif code == 22:
+                bold = False
+            elif code == 23:
+                italic = False
+            elif code == 24:
+                underline = False
+            elif code == 27:
+                reverse = False
+            elif 30 <= code <= 37 or 90 <= code <= 97:
+                fg = _SGR_HEX[str(code)]
+            elif code == 39:
+                fg = None
+            elif 40 <= code <= 47 or 100 <= code <= 107:
+                bg = _SGR_HEX[str(code - 10)]
+            elif code == 49:
+                bg = None
+            elif code in (38, 48):
+                color = None
+                if i + 2 < len(args) and args[i + 1] == 5:                 # 38;5;<0-255>
+                    color = xterm256_hex(min(args[i + 2], 255))
+                    i += 2
+                elif i + 4 < len(args) and args[i + 1] == 2:               # 38;2;<r>;<g>;<b>
+                    r, g, b = (min(value, 255) for value in args[i + 2:i + 5])
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    i += 4
+                if code == 38:
+                    fg = color
+                else:
+                    bg = color
+            i += 1
+        self.style = (fg, bg, bold, italic, underline, reverse)
+
+    # ---- output --------------------------------------------------------
+    @staticmethod
+    def _is_blank(cell: tuple) -> bool:
+        char, (_fg, bg, _bold, _italic, underline, reverse) = cell
+        return char in ("", " ") and bg is None and not underline and not reverse
+
+    @staticmethod
+    def _span(chars: list, style: Optional[tuple]) -> str:
+        if not chars:
+            return ""
+        text = html.escape("".join(chars))
+        fg, bg, bold, italic, underline, reverse = style
+        if reverse:
+            fg, bg = bg or PREVIEW_BACKGROUND, fg or DEFAULT_HEX
+        css = []
+        if fg:
+            css.append(f"color:{fg}")
+        if bg:
+            css.append(f"background-color:{bg}")
+        if bold:
+            css.append("font-weight:bold")
+        if italic:
+            css.append("font-style:italic")
+        if underline:
+            css.append("text-decoration:underline")
+        return f'<span style="{";".join(css)}">{text}</span>' if css else text
+
+    def _line_html(self, line: list) -> str:
+        end = len(line)
+        while end and self._is_blank(line[end - 1]):
+            end -= 1
+        parts, run, style = [], [], None
+        for char, cell_style in line[:end]:
+            if cell_style != style:
+                parts.append(self._span(run, style))
+                run, style = [], cell_style
+            run.append(char)
+        parts.append(self._span(run, style))
+        return "".join(parts)
+
+    def to_html(self) -> str:
+        lines = [self._line_html(line) for line in self.rows]
+        while lines and not lines[-1]:
+            lines.pop()
+        return '<pre style="margin:0">' + "\n".join(lines) + "</pre>"
+
+    def to_text(self) -> str:
+        lines = ["".join(char for char, _ in line).rstrip() for line in self.rows]
+        return "\n".join(lines).strip("\n")
+
+
+def ansi_to_html(data: str) -> str:
+    """Render text with ANSI escape sequences (fastfetch output) as colored HTML."""
+    screen = AnsiScreen()
+    screen.feed(data)
+    return screen.to_html()
+
+
+def ansi_to_text(data: str) -> str:
+    """The same text without any escape sequences."""
+    screen = AnsiScreen()
+    screen.feed(data)
+    return screen.to_text()
+
+
+def find_fastfetch(root: Optional[Path]) -> str:
+    """The binary used for the preview: <project>/build/fastfetch, else the one in PATH."""
+    if root is not None:
+        built = root / "build" / "fastfetch"
+        if built.is_file() and os.access(built, os.X_OK):
+            return str(built)
+    return shutil.which("fastfetch") or ""
+
+
+@dataclass
+class ApplyTarget:
+    key: str
+    label: str            # text of the button
+    who: str              # used in the confirmation: "Install the preset for <who>?"
+    directory: Path       # config.jsonc is installed here
+    needs_root: bool
+    tooltip: str
+    after: str            # shown after a successful install
+
+
+def apply_targets() -> list[ApplyTarget]:
+    return [
+        ApplyTarget(
+            "user", "Apply for current user", "the current user",
+            Path.home() / ".config" / "fastfetch", False,
+            f"Install the preset as ~/.config/fastfetch/{CONFIG_NAME} for the current user.",
+            "Run fastfetch in a new terminal to see it."),
+        ApplyTarget(
+            "skel", "Apply for other users", "users created from now on (/etc/skel)",
+            Path("/etc/skel/.config/fastfetch"), True,
+            f"Install the preset as /etc/skel/.config/fastfetch/{CONFIG_NAME}, so every user "
+            "created later starts with it. Existing users are not changed.",
+            "Users created from now on get this configuration. Existing users are not changed."),
+        ApplyTarget(
+            "root", "Apply for root", "root",
+            Path("/root/.config/fastfetch"), True,
+            f"Install the preset as /root/.config/fastfetch/{CONFIG_NAME}.",
+            "Run fastfetch as root to see it."),
+    ]
+
+
+def apply_command(directory: Path, source: str, escalate: bool) -> list[str]:
+    """The command that creates `directory` (mkdir -p) and installs `source` as config.jsonc."""
+    command = ["sh", "-c", APPLY_SCRIPT, "sh", str(directory), source]
+    return ["pkexec"] + command if escalate else command
+
+
+# ----------------------------------------------------------------------------
 # GUI
 # ----------------------------------------------------------------------------
 
 def build_gui(argument: Optional[str]):
     """Create the QApplication and the main window. Raises ImportError without PyQt6."""
-    from PyQt6.QtCore import Qt, pyqtSignal
-    from PyQt6.QtGui import QFontDatabase
+    from PyQt6.QtCore import Qt, QProcess, QProcessEnvironment, QTimer, pyqtSignal
+    from PyQt6.QtGui import QFont, QFontDatabase
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout,
-        QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-        QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter, QTabWidget,
-        QTextBrowser, QVBoxLayout, QWidget,
+        QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+        QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
+        QTabWidget, QTextBrowser, QVBoxLayout, QWidget,
     )
 
     ROLE = Qt.ItemDataRole.UserRole
@@ -1434,6 +1804,523 @@ def build_gui(argument: Optional[str]):
             self.refresh_counts()
             self.populate(self._letter)
 
+    class PresetsPage(QWidget):
+        """The "Presets" tab: pick and edit a preset, preview it, install it as config.jsonc."""
+
+        def __init__(self, get_root):
+            super().__init__()
+            self.get_root = get_root
+            self.presets: list[Preset] = []
+            self.current: Optional[Preset] = None
+            self.saved_text = ""                  # text of the current preset on disk
+            self.crlf = False                     # the file on disk uses Windows line endings
+            self.dirty = False
+            self._guard = False
+            self._stale = True                    # the preview does not show the current text yet
+            self._rerun = False                   # run fastfetch again when the current run ends
+            self._timed_out = False
+            self._binary_auto = True              # the binary path was filled in automatically
+            self._process: Optional[QProcess] = None
+            self._apply_process: Optional[QProcess] = None
+            self._tmp_config: Optional[str] = None
+            mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+
+            # ---- left: the preset list and the preset text -----------------------
+            self.filter_edit = QLineEdit()
+            self.filter_edit.setPlaceholderText("Filter the presets...")
+            self.filter_edit.setClearButtonEnabled(True)
+            self.list = QListWidget()
+            list_box = QGroupBox("Presets")
+            list_layout = QVBoxLayout(list_box)
+            list_layout.addWidget(self.filter_edit)
+            list_layout.addWidget(self.list, 1)
+
+            self.editor = QPlainTextEdit()
+            self.editor.setFont(mono)
+            self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            self.json_status = QLabel()
+            self.json_status.setWordWrap(True)
+            self.save_button = QPushButton("Save changes")
+            self.save_as_button = QPushButton("Save as...")
+            self.revert_button = QPushButton("Revert")
+            edit_buttons = QHBoxLayout()
+            for button in (self.save_button, self.save_as_button, self.revert_button):
+                edit_buttons.addWidget(button)
+            edit_box = QGroupBox("Preset text (JSONC)")
+            edit_layout = QVBoxLayout(edit_box)
+            edit_layout.addWidget(self.editor, 1)
+            edit_layout.addWidget(self.json_status)
+            edit_layout.addLayout(edit_buttons)
+
+            left = QSplitter(Qt.Orientation.Vertical)
+            left.addWidget(list_box)
+            left.addWidget(edit_box)
+            left.setStretchFactor(0, 2)
+            left.setStretchFactor(1, 5)
+
+            # ---- right: the fastfetch preview ------------------------------------
+            self.binary_edit = QLineEdit()
+            self.binary_edit.setPlaceholderText("Path to the fastfetch binary")
+            self.binary_button = QPushButton("Browse...")
+            binary_row = QHBoxLayout()
+            binary_row.addWidget(QLabel("Fastfetch binary"))
+            binary_row.addWidget(self.binary_edit, 1)
+            binary_row.addWidget(self.binary_button)
+
+            self.refresh_button = QPushButton("Refresh preview")
+            self.live_check = QCheckBox("Update while typing")
+            self.status_label = QLabel()
+            self.status_label.setWordWrap(True)
+            self.status_label.setStyleSheet("color:#888;")
+            control_row = QHBoxLayout()
+            control_row.addWidget(self.refresh_button)
+            control_row.addWidget(self.live_check)
+            control_row.addWidget(self.status_label, 1)
+
+            preview_font = QFont(mono)
+            if preview_font.pointSizeF() > 0:
+                preview_font.setPointSizeF(max(1.0, preview_font.pointSizeF() - PREVIEW_FONT_SHRINK))
+            self.preview = QTextBrowser()
+            self.preview.setFont(preview_font)
+            self.preview.setStyleSheet(f"background:{PREVIEW_BACKGROUND}; color:{DEFAULT_HEX};")
+            self.preview.setPlaceholderText("The output of fastfetch is shown here.")
+            preview_box = QGroupBox("Preview (fastfetch output)")
+            preview_layout = QVBoxLayout(preview_box)
+            preview_layout.addLayout(binary_row)
+            preview_layout.addLayout(control_row)
+            preview_layout.addWidget(self.preview, 1)
+
+            splitter = QSplitter()
+            splitter.addWidget(left)
+            splitter.addWidget(preview_box)
+            splitter.setStretchFactor(0, 4)
+            splitter.setStretchFactor(1, 6)
+            splitter.setSizes([560, 820])
+
+            # ---- bottom: the three apply buttons ---------------------------------
+            self.apply_buttons: list[QPushButton] = []
+            apply_box = QGroupBox(f"Install the preset text above as {CONFIG_NAME}")
+            apply_layout = QHBoxLayout(apply_box)
+            for target in apply_targets():
+                button = QPushButton(target.label)
+                button.setMinimumHeight(34)
+                button.setToolTip(target.tooltip)
+                button.clicked.connect(lambda _checked=False, key=target.key: self.apply(key))
+                apply_layout.addWidget(button, 1)
+                self.apply_buttons.append(button)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(splitter, 1)
+            layout.addWidget(apply_box)
+
+            self.live_timer = QTimer(self)
+            self.live_timer.setSingleShot(True)
+            self.live_timer.setInterval(700)
+            self.live_timer.timeout.connect(self.refresh_preview)
+            self.run_timer = QTimer(self)
+            self.run_timer.setSingleShot(True)
+            self.run_timer.setInterval(PREVIEW_TIMEOUT_MS)
+            self.run_timer.timeout.connect(self.on_run_timeout)
+
+            self.filter_edit.textChanged.connect(self.apply_filter)
+            self.list.currentItemChanged.connect(self.on_item_changed)
+            self.editor.textChanged.connect(self.on_text_changed)
+            self.save_button.clicked.connect(self.save)
+            self.save_as_button.clicked.connect(self.save_as)
+            self.revert_button.clicked.connect(self.revert)
+            self.binary_edit.textEdited.connect(self.on_binary_edited)
+            self.binary_button.clicked.connect(self.choose_binary)
+            self.refresh_button.clicked.connect(self.refresh_preview)
+            self.set_editing_enabled(False)
+
+        # ---- list handling -------------------------------------------------------
+        def root_changed(self) -> None:
+            root = self.get_root()
+            if self._binary_auto:
+                self.binary_edit.setText(find_fastfetch(root))
+            self.dirty = False
+            self.populate("satellaos")
+
+        def populate(self, select_name: Optional[str] = None) -> None:
+            """Reload the list from disk and select `select_name` (or the first preset)."""
+            root = self.get_root()
+            self.presets = scan_presets(root) if root is not None else []
+            self._guard = True
+            try:
+                self.list.clear()
+                for index, preset in enumerate(self.presets):
+                    item = QListWidgetItem(preset.name)
+                    item.setData(ROLE, index)
+                    item.setToolTip(str(preset.path.relative_to(root)))
+                    self.list.addItem(item)
+            finally:
+                self._guard = False
+            self.apply_filter()
+            self.load_preset(None)
+            if self.presets:
+                wanted = next((i for i, p in enumerate(self.presets) if p.name == select_name), 0)
+                self.list.setCurrentRow(wanted)
+
+        def apply_filter(self) -> None:
+            needle = self.filter_edit.text().strip().lower()
+            for row in range(self.list.count()):
+                item = self.list.item(row)
+                item.setHidden(bool(needle) and needle not in self.presets[item.data(ROLE)].name.lower())
+
+        def confirm_discard(self) -> bool:
+            return (not self.dirty) or ask(
+                self, "Unsaved changes", "The preset text has unsaved changes. Discard them?")
+
+        def on_item_changed(self, current, previous) -> None:
+            if self._guard or current is None:
+                return
+            if not self.confirm_discard():
+                self._guard = True
+                self.list.setCurrentItem(previous)
+                self._guard = False
+                return
+            self.load_preset(self.presets[current.data(ROLE)])
+
+        # ---- loading, editing, saving --------------------------------------------
+        def set_editing_enabled(self, enabled: bool) -> None:
+            self.editor.setReadOnly(not enabled)
+            for button in (self.save_button, self.save_as_button, self.revert_button):
+                button.setEnabled(enabled)
+            self.set_apply_enabled(enabled)
+
+        def set_apply_enabled(self, enabled: bool) -> None:
+            for button in self.apply_buttons:
+                button.setEnabled(enabled)
+
+        def load_preset(self, preset: Optional[Preset]) -> None:
+            self.current = preset
+            text = ""
+            if preset is not None:
+                try:
+                    text = preset.path.read_bytes().decode("utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    QMessageBox.critical(self, "Cannot read the preset", f"{preset.path.name}: {exc}")
+                    self.current = None
+            self.crlf = "\r\n" in text
+            text = text.replace("\r\n", "\n")
+            self.saved_text = text
+            self._guard = True
+            try:
+                self.editor.setPlainText(text)
+            finally:
+                self._guard = False
+            self.dirty = False
+            if self.current is None:
+                if self.get_root() is None:
+                    note = "Select a valid fastfetch source folder first."
+                elif not self.presets:
+                    note = f"No presets were found in {PRESETS_REL.as_posix()}/."
+                else:
+                    note = "Select a preset on the list."
+                self.editor.setPlaceholderText(note)
+                self.preview.clear()
+                self.status_label.clear()
+            self.set_editing_enabled(self.current is not None)
+            self.update_json_status()
+            if self.current is not None:
+                self.request_preview()
+
+        def on_text_changed(self) -> None:
+            if self._guard:
+                return
+            self.dirty = self.editor.toPlainText() != self.saved_text
+            self.update_json_status()
+            if self.live_check.isChecked():
+                self.live_timer.start()
+
+        def update_json_status(self) -> None:
+            if self.current is None:
+                self.json_status.clear()
+                return
+            error = jsonc_error(self.editor.toPlainText())
+            text, color = ("Valid JSONC", "#4e9a06") if error is None else (f"Invalid JSONC - {error}", "#cc0000")
+            if self.dirty:
+                text += "   (modified, not saved)"
+            self.json_status.setText(text)
+            self.json_status.setStyleSheet(f"color:{color};")
+
+        def confirm_invalid(self, text: str, verb: str) -> bool:
+            error = jsonc_error(text)
+            return error is None or ask(
+                self, "Invalid JSONC",
+                f"The preset text is not valid JSONC ({error}).\n\n{verb} it anyway?")
+
+        def write_preset(self, path: Path, text: str, crlf: bool) -> bool:
+            data = text.replace("\n", "\r\n") if crlf else text
+            try:
+                path.write_bytes(data.encode("utf-8"))
+            except OSError as exc:
+                QMessageBox.critical(self, "Writing failed", str(exc))
+                return False
+            return True
+
+        def save(self) -> None:
+            root = self.get_root()
+            if self.current is None or root is None:
+                return
+            text = self.editor.toPlainText()
+            if text == self.saved_text:
+                QMessageBox.information(self, "Nothing to save", "The preset was not changed.")
+                return
+            if not self.confirm_invalid(text, "Save") or not self.write_preset(self.current.path, text, self.crlf):
+                return
+            self.saved_text = text
+            self.dirty = False
+            self.update_json_status()
+            QMessageBox.information(
+                self, "Preset saved", f"Saved {self.current.path.relative_to(root)}")
+
+        def save_as(self) -> None:
+            root = self.get_root()
+            if self.current is None or root is None:
+                return
+            name, ok = QInputDialog.getText(
+                self, "Save preset as", "Name of the new preset (letters, digits, '_' and '-'):")
+            if not ok:
+                return
+            name = name.strip()
+            if name.lower().endswith(".jsonc"):
+                name = name[:-len(".jsonc")]
+            if not PRESET_NAME_RE.fullmatch(name):
+                QMessageBox.critical(
+                    self, "Invalid name",
+                    "Use only letters, digits, '_' and '-', and start with a letter or digit.")
+                return
+            path = root / PRESETS_REL / f"{name}.jsonc"
+            if path.exists() and not ask(
+                    self, "Overwrite?", f"{path.relative_to(root)} already exists. Overwrite it?"):
+                return
+            text = self.editor.toPlainText()
+            if not self.confirm_invalid(text, "Save") or not self.write_preset(path, text, False):
+                return
+            # The new preset is now on disk; the one that was open stays as it was saved
+            self.dirty = False
+            self.populate(name)
+
+        def revert(self) -> None:
+            if self.current is not None:
+                self.load_preset(self.current)
+
+        # ---- preview -------------------------------------------------------------
+        def on_binary_edited(self, _text: str) -> None:
+            self._binary_auto = False
+
+        def choose_binary(self) -> None:
+            start = self.binary_edit.text().strip() or str(Path.cwd())
+            filename, _ = QFileDialog.getOpenFileName(self, "Select the fastfetch binary", start)
+            if filename:
+                self.binary_edit.setText(filename)
+                self._binary_auto = False
+                self.request_preview()
+
+        def request_preview(self) -> None:
+            """Run fastfetch now when the tab is visible, otherwise when it is shown next."""
+            if self.isVisible():
+                self.refresh_preview()
+            else:
+                self._stale = True
+
+        def showEvent(self, event) -> None:
+            super().showEvent(event)
+            if self._stale and self.current is not None:
+                self.refresh_preview()
+
+        def refresh_preview(self) -> None:
+            if self._process is not None:
+                self._rerun = True                  # a run is in progress: run again afterwards
+                return
+            binary = self.binary_edit.text().strip()
+            resolved = shutil.which(binary) if binary else None
+            if not resolved:
+                self.preview.setPlainText(
+                    "fastfetch was not found.\n\n"
+                    "Build it with ./build.sh --build-binary, install fastfetch, "
+                    "or choose the binary with Browse...")
+                self.status_label.setText("No fastfetch binary")
+                return
+            self._stale = False
+            self._timed_out = False
+            try:
+                fd, self._tmp_config = tempfile.mkstemp(prefix="fastfetch-preview-", suffix=".jsonc")
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(self.editor.toPlainText())
+            except OSError as exc:
+                self.status_label.setText(f"Cannot write the temporary config: {exc}")
+                return
+
+            env = QProcessEnvironment.systemEnvironment()
+            env.insert("COLUMNS", str(PREVIEW_COLUMNS))
+            env.insert("LINES", str(PREVIEW_LINES))
+            env.insert("COLORTERM", "truecolor")
+            if env.value("TERM", "") in ("", "dumb"):
+                env.insert("TERM", "xterm-256color")
+            process = QProcess(self)
+            process.setProcessEnvironment(env)
+            process.finished.connect(self.on_run_finished)
+            process.errorOccurred.connect(self.on_run_error)
+            self._process = process
+            self.status_label.setText("Running fastfetch...")
+            self.run_timer.start()
+            # "--pipe false" makes fastfetch print the logo and the colors although stdout is no terminal
+            process.start(resolved, ["-c", self._tmp_config, "--pipe", "false"])
+
+        def finish_run(self) -> None:
+            self.run_timer.stop()
+            process, self._process = self._process, None
+            if process is not None:
+                process.deleteLater()
+            if self._tmp_config:
+                try:
+                    os.unlink(self._tmp_config)
+                except OSError:
+                    pass
+                self._tmp_config = None
+
+        def after_run(self) -> None:
+            if self._rerun:
+                self._rerun = False
+                self.refresh_preview()
+
+        def on_run_finished(self, exit_code: int, exit_status) -> None:
+            process = self._process
+            if process is None:
+                return
+            out = bytes(process.readAllStandardOutput()).decode("utf-8", "replace")
+            err = bytes(process.readAllStandardError()).decode("utf-8", "replace")
+            timed_out = self._timed_out
+            self.finish_run()
+
+            shown = out if out.strip() else err
+            if shown.strip():
+                self.preview.setHtml(ansi_to_html(shown))
+            else:
+                self.preview.setPlainText("(fastfetch printed nothing)")
+            problem = ""
+            if timed_out:
+                problem = f"fastfetch needed more than {PREVIEW_TIMEOUT_MS // 1000} s and was stopped."
+            elif exit_status != QProcess.ExitStatus.NormalExit:
+                problem = "fastfetch crashed."
+            elif exit_code != 0:
+                problem = f"fastfetch exited with code {exit_code}."
+            messages = ansi_to_text(err)
+            first_line = messages.splitlines()[0][:200] if messages else ""
+            self.status_label.setText(" ".join(part for part in (problem, first_line) if part) or "OK")
+            self.status_label.setToolTip(messages)
+            self.after_run()
+
+        def on_run_error(self, error) -> None:
+            if error != QProcess.ProcessError.FailedToStart or self._process is None:
+                return                              # crashes are reported by on_run_finished
+            reason = self._process.errorString()
+            self.finish_run()
+            self.preview.clear()
+            self.status_label.setText(f"Cannot start fastfetch: {reason}")
+            self.after_run()
+
+        def on_run_timeout(self) -> None:
+            if self._process is not None:
+                self._timed_out = True
+                self._process.kill()
+
+        # ---- applying the preset -------------------------------------------------
+        def apply(self, key: str) -> None:
+            if self._apply_process is not None:
+                return
+            target = next(t for t in apply_targets() if t.key == key)
+            text = self.editor.toPlainText()
+            if not text.strip():
+                QMessageBox.critical(self, "Cannot apply", "The preset text is empty.")
+                return
+            if not self.confirm_invalid(text, "Install"):
+                return
+            is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+            escalate = target.needs_root and not is_root
+            if escalate and not shutil.which("pkexec"):
+                QMessageBox.critical(
+                    self, "Cannot apply",
+                    f"Writing to {target.directory} needs administrator rights, but pkexec "
+                    "(polkit) was not found. Install polkit or start the editor as root.")
+                return
+
+            name = self.current.name if self.current else "(unsaved text)"
+            config = target.directory / CONFIG_NAME
+            lines = [f"Install the preset '{name}'"
+                     + (" with your unsaved edits" if self.dirty else "")
+                     + f" for {target.who}?",
+                     "",
+                     "This will run:",
+                     f"    mkdir -p {target.directory}",
+                     f"    install -m 644 <preset text> {config}",
+                     "",
+                     f"An existing {CONFIG_NAME} in that folder will be overwritten."]
+            if escalate:
+                lines += ["", "You will be asked for your administrator password (pkexec)."]
+            if not ask(self, target.label, "\n".join(lines) + "\n\nContinue?"):
+                return
+
+            try:
+                fd, tmp = tempfile.mkstemp(prefix="fastfetch-apply-", suffix=".jsonc")
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(text if text.endswith("\n") else text + "\n")
+            except OSError as exc:
+                QMessageBox.critical(self, "Cannot apply", f"Cannot write the temporary file: {exc}")
+                return
+            command = apply_command(target.directory, tmp, escalate)
+            process = QProcess(self)
+            process.finished.connect(
+                lambda code, _status, p=process, t=tmp, tg=target, esc=escalate:
+                self.on_apply_finished(p, t, tg, esc, code))
+            process.errorOccurred.connect(
+                lambda error, p=process, t=tmp:
+                self.on_apply_error(p, t, error))
+            self._apply_process = process
+            self.set_apply_enabled(False)
+            process.start(command[0], command[1:])
+
+        def end_apply(self, process, tmp: str) -> None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            self._apply_process = None
+            process.deleteLater()
+            self.set_apply_enabled(self.current is not None)
+
+        def on_apply_finished(self, process, tmp: str, target: ApplyTarget, escalate: bool, code: int) -> None:
+            err = bytes(process.readAllStandardError()).decode("utf-8", "replace").strip()
+            self.end_apply(process, tmp)
+            if code == 0:
+                QMessageBox.information(
+                    self, "Preset installed", f"Installed {target.directory / CONFIG_NAME}\n\n{target.after}")
+                return
+            if escalate and code in (126, 127) and not err:
+                detail = "The authentication was cancelled or failed."
+            else:
+                detail = err or f"The command exited with code {code}."
+            QMessageBox.critical(self, "Applying failed", f"{target.label}\n\n{detail}")
+
+        def on_apply_error(self, process, tmp: str, error) -> None:
+            if error != QProcess.ProcessError.FailedToStart or process is not self._apply_process:
+                return                              # other errors end in on_apply_finished
+            reason = process.errorString()
+            self.end_apply(process, tmp)
+            QMessageBox.critical(self, "Applying failed", f"The command could not be started: {reason}")
+
+        def shutdown(self) -> None:
+            """Stop a running preview and remove its temporary file (the window is closing)."""
+            self.live_timer.stop()
+            self._rerun = False
+            if self._process is not None:
+                self._process.kill()
+                self._process.waitForFinished(1000)
+            self.finish_run()
+
     class EditorWindow(QMainWindow):
         def __init__(self, root: Optional[Path]):
             super().__init__()
@@ -1453,9 +2340,11 @@ def build_gui(argument: Optional[str]):
 
             self.add_page = AddPage(lambda: self.root)
             self.edit_page = EditPage(lambda: self.root)
+            self.presets_page = PresetsPage(lambda: self.root)
             self.tabs = QTabWidget()
             self.tabs.addTab(self.add_page, "Add logo")
             self.tabs.addTab(self.edit_page, "Edit logo")
+            self.tabs.addTab(self.presets_page, "Presets")
 
             central = QWidget()
             layout = QVBoxLayout(central)
@@ -1480,6 +2369,7 @@ def build_gui(argument: Optional[str]):
                 self.root_status.setStyleSheet("color:#cc0000;")
             self.add_page.root_changed()
             self.edit_page.root_changed()
+            self.presets_page.root_changed()
 
         def choose_root(self) -> None:
             start = self.root_edit.text().strip() or str(Path.cwd())
@@ -1488,11 +2378,12 @@ def build_gui(argument: Optional[str]):
                 self.root_edit.setText(folder)
 
         def closeEvent(self, event) -> None:
-            if self.edit_page.dirty and not ask(
+            if (self.edit_page.dirty or self.presets_page.dirty) and not ask(
                     self, "Unsaved changes",
-                    "The logo in the Edit tab has unsaved changes. Close anyway?"):
+                    "The Edit logo or the Presets tab has unsaved changes. Close anyway?"):
                 event.ignore()
                 return
+            self.presets_page.shutdown()
             event.accept()
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
